@@ -1,0 +1,523 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Market State Engine v1.0
+// Deterministic Confidence-Scoring System for Signal Filtering
+
+//@version=5
+indicator("Market State Engine", overlay=true, max_labels_count=500, max_bars_back=500)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 1: CONFIGURABLE INPUTS
+// All magic numbers are exposed as inputs for flexibility
+// ══════════════════════════════════════════════════════════════════════════════
+
+// --- Symbol & Tick Settings ---
+tickSize        = input.float(0.25, "Tick Size", minval=0.0001, step=0.01, group="Symbol Settings", tooltip="Minimum price movement for this symbol (e.g., 0.25 for ES, 0.01 for stocks)")
+tickBuffer      = input.int(5, "Tick Buffer Count", minval=1, group="Symbol Settings", tooltip="Number of ticks price must exceed swing for valid break")
+
+// --- VWAP Band Settings ---
+vwapBand1Mult   = input.float(1.0, "VWAP Band 1 (σ)", minval=0.5, step=0.1, group="VWAP Settings", tooltip="1st standard deviation multiplier")
+vwapBand2Mult   = input.float(2.0, "VWAP Band 2 (σ)", minval=1.0, step=0.1, group="VWAP Settings", tooltip="2nd standard deviation multiplier")
+vwapBand3Mult   = input.float(3.0, "VWAP Band 3 (σ)", minval=1.5, step=0.1, group="VWAP Settings", tooltip="3rd standard deviation multiplier")
+
+// --- Session Time Settings (America/New_York) ---
+session1Start   = input.session("0300-0400", "Session 1 (Pre-Market)", group="Session Settings", tooltip="First high-value session window")
+session2Start   = input.session("0930-1130", "Session 2 (Open)", group="Session Settings", tooltip="Second high-value session window")
+
+// --- Score Thresholds ---
+thresholdA      = input.int(60, "A Setup Threshold", minval=0, maxval=100, group="Score Thresholds", tooltip="Minimum score for A setup")
+thresholdAPlus  = input.int(75, "A+ Setup Threshold", minval=0, maxval=100, group="Score Thresholds", tooltip="Minimum score for A+ setup")
+thresholdAPlusPlus = input.int(90, "A++ Setup Threshold", minval=0, maxval=100, group="Score Thresholds", tooltip="Minimum score for A++ setup")
+
+// --- CVD Settings ---
+cvdLookback     = input.int(20, "CVD Divergence Lookback", minval=5, maxval=100, group="CVD Settings", tooltip="Maximum bars to look back for CVD divergence")
+
+// --- Swing Detection Settings ---
+swingMethod     = input.string("Wick", "Swing Detection Method", options=["Wick", "Body"], group="Swing Settings", tooltip="Use high/low (Wick) or open/close (Body) for pivot detection")
+pivotLeftBars   = 2  // Locked as per spec
+pivotRightBars  = 2  // Locked as per spec
+
+// --- Visual Settings ---
+showVwapBands   = input.bool(true, "Show VWAP Bands", group="Visuals")
+showSetupLabels = input.bool(true, "Show Setup Labels", group="Visuals")
+showScorePanel  = input.bool(true, "Show Score Panel", group="Visuals")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 2: VWAP CALCULATION (Session-Anchored to NY)
+// Anchors VWAP at the start of each New York session day
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Detect new session start using NY timezone
+// VWAP resets at market open each day
+nyTimezone = "America/New_York"
+isNewSession = ta.change(time("D", "", nyTimezone)) != 0
+
+// Cumulative values for VWAP calculation (reset each session)
+var float cumTypicalPriceVol = 0.0
+var float cumVolume = 0.0
+var float cumVariance = 0.0
+
+// Reset accumulators at session start
+if isNewSession
+    cumTypicalPriceVol := 0.0
+    cumVolume := 0.0
+    cumVariance := 0.0
+
+// Calculate typical price and accumulate
+typicalPrice = (high + low + close) / 3
+cumTypicalPriceVol := cumTypicalPriceVol + typicalPrice * volume
+cumVolume := cumVolume + volume
+
+// VWAP is volume-weighted average of typical price
+vwap_value = cumVolume > 0 ? cumTypicalPriceVol / cumVolume : close
+
+// Calculate standard deviation for bands
+// Using variance = Σ(vol * (price - vwap)²) / Σvol
+priceDeviation = typicalPrice - vwap_value
+cumVariance := cumVariance + volume * priceDeviation * priceDeviation
+vwapStdDev = cumVolume > 0 ? math.sqrt(cumVariance / cumVolume) : 0
+
+// Calculate VWAP bands
+vwapUpper1 = vwap_value + vwapBand1Mult * vwapStdDev
+vwapLower1 = vwap_value - vwapBand1Mult * vwapStdDev
+vwapUpper2 = vwap_value + vwapBand2Mult * vwapStdDev
+vwapLower2 = vwap_value - vwapBand2Mult * vwapStdDev
+vwapUpper3 = vwap_value + vwapBand3Mult * vwapStdDev
+vwapLower3 = vwap_value - vwapBand3Mult * vwapStdDev
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 3: VWAP SCORING FUNCTION
+// Exclusive logic: check outermost band first, then inward
+// Price in 3rd band = +25, in 2nd band = +15, otherwise = 0
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Function to calculate VWAP score with exclusive band logic
+// Returns: score (0, 15, or 25), band level, and band position (upper/lower)
+f_getVwapScore() =>
+    float score = 0
+    int bandLevel = 0
+    int bandPosition = 0  // -1 = lower bands (below VWAP), 0 = at VWAP, +1 = upper bands (above VWAP)
+    
+    // Calculate price distance from VWAP in standard deviations
+    float distFromVwap = vwapStdDev > 0 ? math.abs(close - vwap_value) / vwapStdDev : 0
+    
+    // Determine if price is above or below VWAP
+    bandPosition := close > vwap_value ? 1 : close < vwap_value ? -1 : 0
+    
+    // EXCLUSIVE LOGIC: Check from outermost (3rd) to innermost (2nd)
+    // 3rd band: distance > 2σ AND ≤ 3σ
+    if distFromVwap > vwapBand2Mult and distFromVwap <= vwapBand3Mult
+        score := 25
+        bandLevel := 3
+    // 2nd band: distance > 1σ AND ≤ 2σ
+    else if distFromVwap > vwapBand1Mult and distFromVwap <= vwapBand2Mult
+        score := 15
+        bandLevel := 2
+    // Inside 1st band or beyond 3rd band = no score
+    else
+        score := 0
+        bandLevel := distFromVwap > vwapBand3Mult ? 4 : 1
+    
+    [score, bandLevel, bandPosition]
+
+[vwapScore, currentBandLevel, vwapBandPosition] = f_getVwapScore()
+
+// Check if price is in valid VWAP zone for structure shift (2nd or 3rd band)
+isInValidVwapZone = currentBandLevel == 2 or currentBandLevel == 3
+
+// VWAP Zone Filters for directional signals:
+// - LONGS only valid when price is in LOWER bands (below VWAP) - mean reversion long
+// - SHORTS only valid when price is in UPPER bands (above VWAP) - mean reversion short
+bool isValidForLong = vwapBandPosition <= 0   // At or below VWAP (including lower 2nd/3rd bands)
+bool isValidForShort = vwapBandPosition >= 0  // At or above VWAP (including upper 2nd/3rd bands)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 4: SWING DETECTION
+// Uses ta.pivothigh/ta.pivotlow with left=2, right=2 (locked per spec)
+// Pivots are confirmed (no repainting) - detected 2 bars after occurrence
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Select price source based on swing detection method
+swingHighSource = swingMethod == "Wick" ? high : math.max(open, close)
+swingLowSource  = swingMethod == "Wick" ? low : math.min(open, close)
+
+// Detect confirmed pivots (these are detected pivotRightBars bars late)
+// This ensures no repainting - the pivot is confirmed after right bars close
+pivotHigh = ta.pivothigh(swingHighSource, pivotLeftBars, pivotRightBars)
+pivotLow  = ta.pivotlow(swingLowSource, pivotLeftBars, pivotRightBars)
+
+// Track the most recent swing high and low values and their bar indices
+// Using var to persist values across bars
+var float lastSwingHigh = na
+var int lastSwingHighBar = na
+var float lastSwingLow = na
+var int lastSwingLowBar = na
+
+// Update swing tracking when new pivots are detected
+// Note: pivots are detected pivotRightBars bars after they occur
+if not na(pivotHigh)
+    lastSwingHigh := pivotHigh
+    lastSwingHighBar := bar_index - pivotRightBars  // Actual bar where pivot occurred
+
+if not na(pivotLow)
+    lastSwingLow := pivotLow
+    lastSwingLowBar := bar_index - pivotRightBars  // Actual bar where pivot occurred
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 5: STRUCTURE SHIFT DETECTION
+// Bullish: close breaks above swing high + tick buffer
+// Bearish: close breaks below swing low - tick buffer
+// Must occur in valid VWAP zone (2nd or 3rd band)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Calculate tick buffer in price terms
+tickBufferPrice = tickSize * tickBuffer
+
+// Function to detect structure shifts
+// Returns: [isBullishShift, isBearishShift, brokenPivotBarIndex]
+f_detectStructureShift() =>
+    bool bullishShift = false
+    bool bearishShift = false
+    int pivotBarBroken = na
+    
+    // Bullish Structure Shift Conditions:
+    // 1. Prior swing high exists (confirmed pivot)
+    // 2. Current candle CLOSES above swing high + buffer
+    // 3. Must be in valid VWAP zone (2nd or 3rd band)
+    // 4. VWAP FILTER: Price must be at/below VWAP (lower bands) - NO longs in upper bands
+    if not na(lastSwingHigh) and not na(lastSwingHighBar)
+        float breakLevel = lastSwingHigh + tickBufferPrice
+        if close > breakLevel and isInValidVwapZone and isValidForLong
+            bullishShift := true
+            pivotBarBroken := lastSwingHighBar
+    
+    // Bearish Structure Shift Conditions:
+    // 1. Prior swing low exists (confirmed pivot)
+    // 2. Current candle CLOSES below swing low - buffer
+    // 3. Must be in valid VWAP zone (2nd or 3rd band)
+    // 4. VWAP FILTER: Price must be at/above VWAP (upper bands) - NO shorts in lower bands
+    if not na(lastSwingLow) and not na(lastSwingLowBar)
+        float breakLevel = lastSwingLow - tickBufferPrice
+        if close < breakLevel and isInValidVwapZone and isValidForShort
+            bearishShift := true
+            pivotBarBroken := lastSwingLowBar
+    
+    [bullishShift, bearishShift, pivotBarBroken]
+
+[rawBullishShift, rawBearishShift, brokenPivotBar] = f_detectStructureShift()
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 6: ALERT DE-DUPLICATION
+// Prevents multiple alerts on same structure shift
+// Tracks broken pivot bar indices to ensure one alert per unique break
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Track last alerted pivot bars to prevent duplicate alerts
+var int lastBullishAlertPivotBar = na
+var int lastBearishAlertPivotBar = na
+
+// De-duplicated structure shift signals
+// Only fire if this is a NEW pivot break (different pivot bar index)
+bool bullishShift = rawBullishShift and (na(lastBullishAlertPivotBar) or brokenPivotBar != lastBullishAlertPivotBar)
+bool bearishShift = rawBearishShift and (na(lastBearishAlertPivotBar) or brokenPivotBar != lastBearishAlertPivotBar)
+
+// Update alert tracking state when signals fire
+if bullishShift
+    lastBullishAlertPivotBar := brokenPivotBar
+if bearishShift
+    lastBearishAlertPivotBar := brokenPivotBar
+
+// Combined structure shift flag (either bullish or bearish)
+bool hasStructureShift = bullishShift or bearishShift
+
+// Structure score is binary: 25 if valid shift, 0 otherwise
+float structureScore = hasStructureShift ? 25.0 : 0.0
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 7: CVD (CUMULATIVE VOLUME DELTA) PROXY
+// Approximates order flow using candle direction * volume
+// Close > Open = buying pressure (+volume)
+// Close < Open = selling pressure (-volume)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Calculate single-bar delta
+float barDelta = close > open ? volume : close < open ? -volume : 0
+
+// Cumulative CVD (session-reset)
+var float cvd = 0.0
+if isNewSession
+    cvd := 0.0
+cvd := cvd + barDelta
+
+// Track CVD at swing points for divergence detection
+var float cvdAtLastSwingHigh = na
+var float cvdAtLastSwingLow = na
+var float priceAtLastSwingHigh = na
+var float priceAtLastSwingLow = na
+var float cvdAtPrevSwingHigh = na
+var float cvdAtPrevSwingLow = na
+var float priceAtPrevSwingHigh = na
+var float priceAtPrevSwingLow = na
+
+// Update CVD tracking at swing points
+if not na(pivotHigh)
+    cvdAtPrevSwingHigh := cvdAtLastSwingHigh
+    priceAtPrevSwingHigh := priceAtLastSwingHigh
+    cvdAtLastSwingHigh := cvd[pivotRightBars]  // CVD at the actual pivot bar
+    priceAtLastSwingHigh := pivotHigh
+
+if not na(pivotLow)
+    cvdAtPrevSwingLow := cvdAtLastSwingLow
+    priceAtPrevSwingLow := priceAtLastSwingLow
+    cvdAtLastSwingLow := cvd[pivotRightBars]
+    priceAtLastSwingLow := pivotLow
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 8: CVD SCORING FUNCTION
+// Divergence (premium): Price HH + CVD LH (bearish) or Price LL + CVD HL (bullish) = +25
+// Confirmation: Price and CVD both make HH or LL = +20
+// Only evaluated if structure shift exists
+// ══════════════════════════════════════════════════════════════════════════════
+
+f_getCvdScore(isBullish, isBearish) =>
+    float score = 0.0
+    string cvdState = "Neutral"
+    
+    // Only calculate if structure shift is present
+    if not (isBullish or isBearish)
+        score := 0.0
+        cvdState := "N/A"
+    else
+        // Check we have enough swing data for comparison
+        bool hasSwingData = not na(priceAtLastSwingHigh) and not na(priceAtPrevSwingHigh) and 
+                           not na(priceAtLastSwingLow) and not na(priceAtPrevSwingLow)
+        
+        if hasSwingData
+            // For BULLISH structure shift, check for bullish divergence or confirmation
+            if isBullish
+                // Bullish Divergence: Price makes Lower Low but CVD makes Higher Low
+                bool priceLowerLow = priceAtLastSwingLow < priceAtPrevSwingLow
+                bool cvdHigherLow = cvdAtLastSwingLow > cvdAtPrevSwingLow
+                
+                // Bullish Confirmation: Both price and CVD make Higher High
+                bool priceHigherHigh = priceAtLastSwingHigh > priceAtPrevSwingHigh
+                bool cvdHigherHigh = cvdAtLastSwingHigh > cvdAtPrevSwingHigh
+                
+                if priceLowerLow and cvdHigherLow
+                    score := 25.0
+                    cvdState := "Divergence"
+                else if priceHigherHigh and cvdHigherHigh
+                    score := 20.0
+                    cvdState := "Confirmation"
+                else
+                    score := 0.0
+                    cvdState := "Neutral"
+            
+            // For BEARISH structure shift, check for bearish divergence or confirmation
+            if isBearish
+                // Bearish Divergence: Price makes Higher High but CVD makes Lower High
+                bool priceHigherHigh2 = priceAtLastSwingHigh > priceAtPrevSwingHigh
+                bool cvdLowerHigh = cvdAtLastSwingHigh < cvdAtPrevSwingHigh
+                
+                // Bearish Confirmation: Both price and CVD make Lower Low
+                bool priceLowerLow2 = priceAtLastSwingLow < priceAtPrevSwingLow
+                bool cvdLowerLow = cvdAtLastSwingLow < cvdAtPrevSwingLow
+                
+                if priceHigherHigh2 and cvdLowerHigh
+                    score := 25.0
+                    cvdState := "Divergence"
+                else if priceLowerLow2 and cvdLowerLow
+                    score := 20.0
+                    cvdState := "Confirmation"
+                else
+                    score := 0.0
+                    cvdState := "Neutral"
+    
+    [score, cvdState]
+
+[cvdScore, cvdStateText] = f_getCvdScore(bullishShift, bearishShift)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 9: TIME-OF-DAY SCORING
+// High-value sessions in America/New_York timezone
+// Session 1: 03:00-04:00 NY (Pre-market) = +25
+// Session 2: 09:30-11:30 NY (Market open) = +25
+// All other times = 0
+// ══════════════════════════════════════════════════════════════════════════════
+
+f_getTimeScore() =>
+    float score = 0.0
+    bool inSession = false
+    
+    // Check if current bar is within session 1 (pre-market)
+    bool inSession1 = not na(time(timeframe.period, session1Start, nyTimezone))
+    
+    // Check if current bar is within session 2 (market open)
+    bool inSession2 = not na(time(timeframe.period, session2Start, nyTimezone))
+    
+    // Score +25 if in either high-value session
+    if inSession1 or inSession2
+        score := 25.0
+        inSession := true
+    
+    [score, inSession]
+
+[timeScore, isInActiveSession] = f_getTimeScore()
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 10: TOTAL SCORE CALCULATION
+// Structure shift is HARD GATE - no shift means score = 0
+// Maximum possible score: 100 (25 + 25 + 25 + 25)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Calculate total score with hard gate logic
+// If no structure shift, total score is ZERO regardless of other factors
+float totalScore = hasStructureShift ? (vwapScore + structureScore + cvdScore + timeScore) : 0.0
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 11: SETUP CLASSIFICATION
+// A Setup:   Score ≥ 60 (Structure + Time + VWAP)
+// A+ Setup:  Score ≥ 75 (Structure + Time + VWAP + CVD)
+// A++ Setup: Score ≥ 90 (All factors with VWAP 3rd band)
+// ══════════════════════════════════════════════════════════════════════════════
+
+string setupGrade = "None"
+color setupColor = color.gray
+
+if totalScore >= thresholdAPlusPlus
+    setupGrade := "A++"
+else if totalScore >= thresholdAPlus
+    setupGrade := "A+"
+else if totalScore >= thresholdA
+    setupGrade := "A"
+
+// Determine direction string
+string direction = bullishShift ? "Long" : bearishShift ? "Short" : "None"
+
+// DIRECTION-BASED COLORS (consistent coloring):
+// ALL bullish/long signals = GREEN
+// ALL bearish/short signals = RED
+color bullishColor = color.new(color.green, 0)
+color bearishColor = color.new(color.red, 0)
+
+// Set setupColor based on direction, not score
+if bullishShift
+    setupColor := bullishColor
+else if bearishShift
+    setupColor := bearishColor
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 12: ALERT CONDITIONS
+// Alerts fire only on confirmation candle close
+// One alert per unique structure shift (de-duplicated above)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Build alert message with all relevant information
+f_buildAlertMessage(grade, score, dir, vwap, structure, cvdSc, timeSc, cvdSt) =>
+    string msg = grade + " Setup Detected (Score: " + str.tostring(score, "#") + ")\n"
+    msg += "Components: VWAP(" + str.tostring(vwap, "#") + ") + Structure(" + str.tostring(structure, "#") + ") + CVD(" + str.tostring(cvdSc, "#") + ") + Time(" + str.tostring(timeSc, "#") + ")\n"
+    msg += "CVD State: " + cvdSt + "\n"
+    msg += "Direction: " + dir + "\n"
+    msg += "Timeframe: 1m"
+    msg
+
+// Bullish alert condition (A grade or higher)
+bool bullishAlert = bullishShift and totalScore >= thresholdA
+string bullishMessage = f_buildAlertMessage(setupGrade, totalScore, "Long", vwapScore, structureScore, cvdScore, timeScore, cvdStateText)
+alertcondition(bullishAlert, title="Bullish Setup", message="{{plot_0}}")
+
+// Bearish alert condition (A grade or higher)
+bool bearishAlert = bearishShift and totalScore >= thresholdA
+string bearishMessage = f_buildAlertMessage(setupGrade, totalScore, "Short", vwapScore, structureScore, cvdScore, timeScore, cvdStateText)
+alertcondition(bearishAlert, title="Bearish Setup", message="{{plot_1}}")
+
+// Combined alert for any setup
+bool anyAlert = bullishAlert or bearishAlert
+alertcondition(anyAlert, title="Any Setup", message="Market State Engine: Setup Detected")
+
+// Trigger dynamic alerts with full message
+if bullishAlert
+    alert(bullishMessage, alert.freq_once_per_bar_close)
+if bearishAlert
+    alert(bearishMessage, alert.freq_once_per_bar_close)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 13: VISUAL OUTPUTS
+// VWAP bands, setup labels, and score display
+// ══════════════════════════════════════════════════════════════════════════════
+
+// --- VWAP Band Plots ---
+plot(showVwapBands ? vwap_value : na, "VWAP", color=color.new(color.yellow, 20), linewidth=2)
+plot(showVwapBands ? vwapUpper1 : na, "VWAP +1σ", color=color.new(color.blue, 60), linewidth=1)
+plot(showVwapBands ? vwapLower1 : na, "VWAP -1σ", color=color.new(color.blue, 60), linewidth=1)
+plot(showVwapBands ? vwapUpper2 : na, "VWAP +2σ", color=color.new(color.purple, 40), linewidth=1)
+plot(showVwapBands ? vwapLower2 : na, "VWAP -2σ", color=color.new(color.purple, 40), linewidth=1)
+plot(showVwapBands ? vwapUpper3 : na, "VWAP +3σ", color=color.new(color.red, 40), linewidth=1)
+plot(showVwapBands ? vwapLower3 : na, "VWAP -3σ", color=color.new(color.red, 40), linewidth=1)
+
+// --- Setup Labels (GREEN for Long, RED for Short) ---
+if showSetupLabels and bullishAlert
+    label.new(bar_index, low, setupGrade + "\n▲ " + str.tostring(totalScore, "#"), 
+              style=label.style_label_up, color=bullishColor, textcolor=color.white, size=size.small)
+
+if showSetupLabels and bearishAlert
+    label.new(bar_index, high, setupGrade + "\n▼ " + str.tostring(totalScore, "#"), 
+              style=label.style_label_down, color=bearishColor, textcolor=color.white, size=size.small)
+
+// --- Swing Point Markers (subtle) ---
+plotshape(not na(pivotHigh), "Swing High", shape.triangledown, location.abovebar, color=color.new(color.red, 70), size=size.tiny)
+plotshape(not na(pivotLow), "Swing Low", shape.triangleup, location.belowbar, color=color.new(color.green, 70), size=size.tiny)
+
+// --- Score Panel (Table in top-right) ---
+var table scorePanel = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 80), border_width=1)
+
+if showScorePanel and barstate.islast
+    // Header
+    table.cell(scorePanel, 0, 0, "Component", text_color=color.white, text_size=size.small)
+    table.cell(scorePanel, 1, 0, "Score", text_color=color.white, text_size=size.small)
+    
+    // Current scores (only meaningful if structure shift exists)
+    string vwapText = hasStructureShift ? str.tostring(vwapScore, "#") : "-"
+    string structText = str.tostring(structureScore, "#")
+    string cvdText = hasStructureShift ? str.tostring(cvdScore, "#") : "-"
+    string timeText = hasStructureShift ? str.tostring(timeScore, "#") : "-"
+    
+    table.cell(scorePanel, 0, 1, "VWAP Zone", text_color=color.gray, text_size=size.tiny)
+    table.cell(scorePanel, 1, 1, vwapText + "/25", text_color=color.gray, text_size=size.tiny)
+    
+    table.cell(scorePanel, 0, 2, "Structure", text_color=color.gray, text_size=size.tiny)
+    table.cell(scorePanel, 1, 2, structText + "/25", text_color=color.gray, text_size=size.tiny)
+    
+    table.cell(scorePanel, 0, 3, "CVD", text_color=color.gray, text_size=size.tiny)
+    table.cell(scorePanel, 1, 3, cvdText + "/25", text_color=color.gray, text_size=size.tiny)
+    
+    table.cell(scorePanel, 0, 4, "Session", text_color=color.gray, text_size=size.tiny)
+    table.cell(scorePanel, 1, 4, timeText + "/25", text_color=color.gray, text_size=size.tiny)
+    
+    // Total with grade
+    string totalText = str.tostring(totalScore, "#") + "/100"
+    string gradeText = setupGrade != "None" ? " (" + setupGrade + ")" : ""
+    table.cell(scorePanel, 0, 5, "TOTAL", text_color=color.white, text_size=size.small)
+    table.cell(scorePanel, 1, 5, totalText + gradeText, text_color=setupColor, text_size=size.small)
+
+// --- Background highlight for active sessions ---
+bgcolor(isInActiveSession ? color.new(color.green, 95) : na, title="Active Session")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 14: DATA EXPORTS (for external analysis)
+// Plot values can be referenced in alerts or external systems
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Plot total score (0-100 scale) - can be used in alerts
+plot(totalScore, "Total Score", color=color.new(color.white, 100), display=display.data_window)
+plot(vwapScore, "VWAP Score", color=color.new(color.white, 100), display=display.data_window)
+plot(structureScore, "Structure Score", color=color.new(color.white, 100), display=display.data_window)
+plot(cvdScore, "CVD Score", color=color.new(color.white, 100), display=display.data_window)
+plot(timeScore, "Time Score", color=color.new(color.white, 100), display=display.data_window)
+plot(bullishShift ? 1 : 0, "Bullish Signal", color=color.new(color.white, 100), display=display.data_window)
+plot(bearishShift ? 1 : 0, "Bearish Signal", color=color.new(color.white, 100), display=display.data_window)
+plot(vwapBandPosition, "VWAP Band Position (-1=Lower, 0=At, +1=Upper)", color=color.new(color.white, 100), display=display.data_window)
+plot(currentBandLevel, "VWAP Band Level (1-4)", color=color.new(color.white, 100), display=display.data_window)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// END OF MARKET STATE ENGINE
+// ══════════════════════════════════════════════════════════════════════════════
